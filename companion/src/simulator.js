@@ -29,6 +29,9 @@ class Simulator extends EventEmitter {
     if (this.timer) return;
     this.round = 0;
     this.emit('game', 'detected', { id: 21640, name: 'VALORANT' });
+    // Announce the local player so kill_feed lines (attacker "You") are counted
+    // as the streamer's kills and carry weapon/victim detail.
+    this.emit('gep-info', { gameId: 21640, feature: 'me', category: 'me', key: 'player_name', value: 'You' });
     this.emit('gep-event', { gameId: 21640, feature: 'match_info', key: 'match_start', value: '' });
     this.emit('log', 'info', 'simulator started — feeding a mock Valorant match');
     // Drive rounds on a self-scheduling chain so kills can burst close together
@@ -101,14 +104,17 @@ class Simulator extends EventEmitter {
   }
 
   _killFeed(weapon, victim, headshot) {
-    const value = JSON.stringify({
+    // GepService decodes JSON-string GEP values before the normalizer sees
+    // them, so the simulator emits the already-decoded object to match.
+    const weaponTex = { Vandal: 'TX_Hud_AR_Vandal', Operator: 'TX_Hud_SR_Sniper', Sheriff: 'TX_Hud_Pistol_Luger' };
+    const value = {
       attacker: 'You',
       victim,
       is_attacker_teammate: true,
       is_victim_teammate: false,
-      weapon: 'TX_Hud_AR_' + (weapon === 'Vandal' ? 'Vandal' : weapon === 'Operator' ? 'Sniper' : 'Standard'),
+      weapon: weaponTex[weapon] || 'TX_Hud_AR_Standard',
       headshot: !!headshot,
-    });
+    };
     this.emit('gep-event', { gameId: 21640, feature: 'match_info', key: 'kill_feed', value });
   }
 }

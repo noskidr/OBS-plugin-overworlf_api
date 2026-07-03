@@ -49,8 +49,25 @@ class WsForwarder extends EventEmitter {
 
   stop() {
     this.shouldRun = false;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null; // else a later start() can never reschedule
+    }
     this._teardown();
+  }
+
+  // Force an immediate reconnect regardless of whether settings changed.
+  reconnect() {
+    if (!this.shouldRun) {
+      this.start();
+      return;
+    }
+    this._teardown();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this._connect();
   }
 
   isConnected() {
@@ -120,9 +137,10 @@ class WsForwarder extends EventEmitter {
     });
 
     const onGone = (why) => {
-      if (this.connected || this.socket) {
-        this.emit('log', 'debug', `plugin connection closed (${why})`);
-      }
+      // Ignore late close/error events from a socket we've already replaced —
+      // otherwise a stale event would tear down the new connection.
+      if (this.socket !== socket) return;
+      this.emit('log', 'debug', `plugin connection closed (${why})`);
       this._teardown();
       this._scheduleReconnect();
     };
@@ -130,7 +148,14 @@ class WsForwarder extends EventEmitter {
     socket.on('error', (err) => onGone(err.code || err.message));
     socket.on('close', () => onGone('close'));
 
-    socket.connect(this.port, this.host);
+    // socket.connect throws synchronously on an out-of-range port; don't let
+    // that wedge the forwarder with this.socket set.
+    try {
+      socket.connect(this.port, this.host);
+    } catch (err) {
+      this.emit('log', 'warn', `invalid connection settings: ${err.message}`);
+      onGone(err.message);
+    }
   }
 
   _drainFrames() {
@@ -148,7 +173,16 @@ class WsForwarder extends EventEmitter {
         offset = 4;
       } else if (len === 127) {
         if (this.recvBuffer.length < 10) return;
-        len = Number(this.recvBuffer.readBigUInt64BE(2));
+        const big = this.recvBuffer.readBigUInt64BE(2);
+        // The plugin never sends frames this large; a bogus huge length would
+        // otherwise stall the parser forever waiting for bytes. Drop the link.
+        if (big > 4n * 1024n * 1024n) {
+          this.emit('log', 'warn', 'oversized frame from plugin — dropping connection');
+          this._teardown();
+          this._scheduleReconnect();
+          return;
+        }
+        len = Number(big);
         offset = 10;
       }
       const maskLen = masked ? 4 : 0;

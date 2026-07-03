@@ -112,8 +112,11 @@ private:
 	std::atomic<bool> device_active_{false};
 
 	/* chat */
-	mutable std::mutex chat_mutex_;
+	mutable std::mutex chat_mutex_; /* guards chat_cfg_ only */
 	ChatConfig chat_cfg_;
+	/* Serializes IRC thread lifecycle (start/stop/join/assign) so the
+	   device-auth worker and the UI thread can't race on irc_thread_. */
+	std::mutex irc_lifecycle_mutex_;
 	std::thread irc_thread_;
 	std::atomic<bool> irc_should_run_{false};
 	std::atomic<bool> irc_connected_{false};

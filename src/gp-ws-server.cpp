@@ -8,6 +8,8 @@ frames, fragmentation, ping/pong/close), unmasked server frames.
 #include "gp-sha1.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -77,6 +79,39 @@ std::string trim(const std::string &s)
 	return s.substr(a, b - a + 1);
 }
 
+/* Percent-decode a URL query component so tokens containing reserved
+   characters (%, &, =, spaces …) match what the client configured. */
+std::string url_decode(const std::string &s)
+{
+	std::string out;
+	out.reserve(s.size());
+	auto hex = [](char c) -> int {
+		if (c >= '0' && c <= '9')
+			return c - '0';
+		if (c >= 'a' && c <= 'f')
+			return c - 'a' + 10;
+		if (c >= 'A' && c <= 'F')
+			return c - 'A' + 10;
+		return -1;
+	};
+	for (size_t i = 0; i < s.size(); i++) {
+		if (s[i] == '%' && i + 2 < s.size()) {
+			int hi = hex(s[i + 1]);
+			int lo = hex(s[i + 2]);
+			if (hi >= 0 && lo >= 0) {
+				out.push_back(static_cast<char>((hi << 4) | lo));
+				i += 2;
+				continue;
+			}
+		}
+		if (s[i] == '+')
+			out.push_back(' ');
+		else
+			out.push_back(s[i]);
+	}
+	return out;
+}
+
 bool send_all(gp_socket_t sock, const uint8_t *data, size_t len)
 {
 	size_t sent = 0;
@@ -118,10 +153,19 @@ std::vector<uint8_t> build_frame(uint8_t opcode, const std::string &payload)
 
 struct ClientConn {
 	int id = 0;
-	gp_socket_t sock = GP_INVALID_SOCKET;
-	std::thread thread;
+	std::atomic<gp_socket_t> sock{GP_INVALID_SOCKET};
 	std::mutex write_mutex;
 	std::atomic<bool> open{false};
+
+	/* Idempotent close: only the thread that wins the exchange closes the fd,
+	   so drop_client / stop / close_client can't double-close or race on a
+	   reused handle. */
+	void close_socket()
+	{
+		gp_socket_t s = sock.exchange(GP_INVALID_SOCKET);
+		if (s != GP_INVALID_SOCKET)
+			gp_closesocket(s);
+	}
 };
 
 struct WsServer::Impl {
@@ -134,6 +178,13 @@ struct WsServer::Impl {
 	std::mutex clients_mutex;
 	std::map<int, std::shared_ptr<ClientConn>> clients;
 	int next_id = 1;
+
+	/* Live client-thread accounting so stop() can wait for every detached
+	   client thread to exit before Impl is destroyed (prevents use-after-free
+	   / calling into the unloaded DLL at shutdown). */
+	std::atomic<int> live_threads{0};
+	std::mutex done_mutex;
+	std::condition_variable done_cv;
 
 	MessageHandler on_message;
 	ConnectHandler on_connect;
@@ -176,7 +227,7 @@ struct WsServer::Impl {
 			return false;
 		std::vector<uint8_t> f = build_frame(opcode, payload);
 		std::lock_guard<std::mutex> lock(c->write_mutex);
-		return send_all(c->sock, f.data(), f.size());
+		return send_all(c->sock.load(), f.data(), f.size());
 	}
 
 	/* Read HTTP request until CRLFCRLF (with a sane cap), perform WS handshake.
@@ -186,7 +237,7 @@ struct WsServer::Impl {
 		std::string req;
 		uint8_t b;
 		while (req.size() < 16 * 1024) {
-			if (!recv_byte(c->sock, &b))
+			if (!recv_byte(c->sock.load(), &b))
 				return false;
 			req.push_back(static_cast<char>(b));
 			if (req.size() >= 4 && req.compare(req.size() - 4, 4, "\r\n\r\n") == 0)
@@ -233,7 +284,7 @@ struct WsServer::Impl {
 		bool is_upgrade = to_lower(header("upgrade")).find("websocket") != std::string::npos;
 		if (key.empty() || !is_upgrade) {
 			static const char *bad = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
-			send_all(c->sock, reinterpret_cast<const uint8_t *>(bad), strlen(bad));
+			send_all(c->sock.load(), reinterpret_cast<const uint8_t *>(bad), strlen(bad));
 			return false;
 		}
 
@@ -246,7 +297,7 @@ struct WsServer::Impl {
 				size_t amp = t.find('&');
 				if (amp != std::string::npos)
 					t = t.substr(0, amp);
-				ok = (t == token);
+				ok = (url_decode(t) == token);
 			}
 			if (!ok) {
 				std::string auth = header("authorization");
@@ -256,7 +307,7 @@ struct WsServer::Impl {
 			}
 			if (!ok) {
 				static const char *denied = "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n";
-				send_all(c->sock, reinterpret_cast<const uint8_t *>(denied), strlen(denied));
+				send_all(c->sock.load(), reinterpret_cast<const uint8_t *>(denied), strlen(denied));
 				blog(LOG_WARNING, "[gamepulse] WS client rejected: bad token");
 				return false;
 			}
@@ -271,7 +322,7 @@ struct WsServer::Impl {
 				   "Connection: Upgrade\r\n"
 				   "Sec-WebSocket-Accept: " +
 				   accept + "\r\n\r\n";
-		return send_all(c->sock, reinterpret_cast<const uint8_t *>(resp.data()), resp.size());
+		return send_all(c->sock.load(), reinterpret_cast<const uint8_t *>(resp.data()), resp.size());
 	}
 
 	void client_loop(std::shared_ptr<ClientConn> c)
@@ -297,7 +348,7 @@ struct WsServer::Impl {
 
 		for (;;) {
 			uint8_t hdr[2];
-			if (!recv_exact(c->sock, hdr, 2))
+			if (!recv_exact(c->sock.load(), hdr, 2))
 				break;
 			bool fin = (hdr[0] & 0x80) != 0;
 			uint8_t opcode = hdr[0] & 0x0F;
@@ -306,12 +357,12 @@ struct WsServer::Impl {
 
 			if (len == 126) {
 				uint8_t ext[2];
-				if (!recv_exact(c->sock, ext, 2))
+				if (!recv_exact(c->sock.load(), ext, 2))
 					break;
 				len = (static_cast<uint64_t>(ext[0]) << 8) | ext[1];
 			} else if (len == 127) {
 				uint8_t ext[8];
-				if (!recv_exact(c->sock, ext, 8))
+				if (!recv_exact(c->sock.load(), ext, 8))
 					break;
 				len = 0;
 				for (int i = 0; i < 8; i++)
@@ -323,12 +374,12 @@ struct WsServer::Impl {
 
 			uint8_t mask[4] = {0, 0, 0, 0};
 			if (masked) {
-				if (!recv_exact(c->sock, mask, 4))
+				if (!recv_exact(c->sock.load(), mask, 4))
 					break;
 			}
 
 			std::vector<uint8_t> payload(static_cast<size_t>(len));
-			if (len > 0 && !recv_exact(c->sock, payload.data(), payload.size()))
+			if (len > 0 && !recv_exact(c->sock.load(), payload.data(), payload.size()))
 				break;
 			if (masked) {
 				for (size_t i = 0; i < payload.size(); i++)
@@ -372,10 +423,7 @@ struct WsServer::Impl {
 	void drop_client(const std::shared_ptr<ClientConn> &c, bool was_open)
 	{
 		bool notify = c->open.exchange(false) || was_open;
-		if (c->sock != GP_INVALID_SOCKET) {
-			gp_closesocket(c->sock);
-			c->sock = GP_INVALID_SOCKET;
-		}
+		c->close_socket();
 		{
 			std::lock_guard<std::mutex> lock(clients_mutex);
 			clients.erase(c->id);
@@ -410,6 +458,20 @@ struct WsServer::Impl {
 			int flag = 1;
 			setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&flag), sizeof(flag));
 
+			/* Bound recv() so a client that connects but never sends can't
+			   pin a reader thread forever (and thus block stop()). 60s is
+			   ample for a live event stream; the companion pings every 20s. */
+#ifdef _WIN32
+			DWORD rcv_timeout = 60000;
+			setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&rcv_timeout),
+				   sizeof(rcv_timeout));
+#else
+			struct timeval rcv_timeout;
+			rcv_timeout.tv_sec = 60;
+			rcv_timeout.tv_usec = 0;
+			setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
+#endif
+
 			auto c = std::make_shared<ClientConn>();
 			c->sock = s;
 			{
@@ -417,8 +479,17 @@ struct WsServer::Impl {
 				c->id = next_id++;
 				clients[c->id] = c;
 			}
-			c->thread = std::thread([this, c]() { client_loop(c); });
-			c->thread.detach();
+			live_threads.fetch_add(1);
+			std::thread([this, c]() {
+				client_loop(c);
+				/* Decrement + notify under done_mutex so stop()'s wait can't
+				   miss the wakeup; after this the thread touches no Impl state. */
+				{
+					std::lock_guard<std::mutex> lock(done_mutex);
+					live_threads.fetch_sub(1);
+				}
+				done_cv.notify_all();
+			}).detach();
 		}
 	}
 };
@@ -497,9 +568,8 @@ void WsServer::stop()
 	if (impl->accept_thread.joinable())
 		impl->accept_thread.join();
 
-	/* Close all client sockets; their detached threads will fall out of
-	   recv and clean themselves up. Snapshot first to avoid holding the
-	   lock while sockets close. */
+	/* Close all client sockets to wake their detached threads out of recv.
+	   Snapshot first to avoid holding the lock while sockets close. */
 	std::vector<std::shared_ptr<ClientConn>> snapshot;
 	{
 		std::lock_guard<std::mutex> lock(impl->clients_mutex);
@@ -508,9 +578,20 @@ void WsServer::stop()
 	}
 	for (auto &c : snapshot) {
 		c->open = false;
-		if (c->sock != GP_INVALID_SOCKET)
-			gp_closesocket(c->sock);
+		c->close_socket();
 	}
+	snapshot.clear();
+
+	/* Wait for every client thread to finish touching Impl before returning
+	   (the destructor runs right after). Bounded so a wedged socket can't hang
+	   OBS shutdown forever. */
+	{
+		std::unique_lock<std::mutex> lock(impl->done_mutex);
+		impl->done_cv.wait_for(lock, std::chrono::seconds(5),
+				       [this]() { return impl->live_threads.load() == 0; });
+	}
+	if (impl->live_threads.load() != 0)
+		blog(LOG_WARNING, "[gamepulse] %d WS client thread(s) still active at stop", impl->live_threads.load());
 
 	blog(LOG_INFO, "[gamepulse] WebSocket server stopped");
 }
@@ -562,8 +643,7 @@ void WsServer::close_client(int client_id)
 	}
 	impl->send_frame(c, 0x8, "");
 	c->open = false;
-	if (c->sock != GP_INVALID_SOCKET)
-		gp_closesocket(c->sock);
+	c->close_socket();
 }
 
 int WsServer::client_count() const

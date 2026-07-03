@@ -11,13 +11,10 @@ on:
 permissions:
   contents: write
 jobs:
-  check-format:
-    name: Check Formatting 🔍
-    if: github.ref_name == 'master' || github.ref_name == 'main'
-    uses: ./.github/workflows/check-format.yaml
-    permissions:
-      contents: read
-
+  # GamePulse is a Windows-only product (Overwolf GEP + Valorant are Windows-only),
+  # so CI builds Windows only. The clang-format/gersemi format checks require a
+  # macOS/Linux runner and are not gated in CI; run them locally before pushing
+  # (see CLAUDE.md).
   build-project:
     name: Build Project 🧱
     uses: ./.github/workflows/build-project.yaml

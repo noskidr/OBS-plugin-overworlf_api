@@ -67,6 +67,13 @@ GpDock::GpDock(QWidget *parent) : QWidget(parent)
 GpDock::~GpDock()
 {
 	GpCore::instance().on_ui_update = nullptr;
+	/* Cancel any in-flight Twitch device auth and JOIN its worker before this
+	   QObject is torn down, so a late on_code/on_done callback can't call
+	   QMetaObject::invokeMethod() on a freed dock (use-after-free). `this` is
+	   still valid throughout the destructor body, so an already-running
+	   callback completes safely, and no new one can start after the join. */
+	if (GpCore::instance().twitch())
+		GpCore::instance().twitch()->cancel_device_auth();
 }
 
 void GpDock::buildUi()
@@ -274,7 +281,10 @@ void GpDock::onComment()
 	if (text.isEmpty())
 		return;
 	comment_edit_->clear();
-	GpCore::instance().submit_manual("manual_comment", text.toStdString(), ACTION_CHAPTER | ACTION_MARKER);
+	uint32_t actions = ACTION_MARKER;
+	if (obs_data_get_bool(GpCore::instance().config(), "chapter_on_manual_comment"))
+		actions |= ACTION_CHAPTER;
+	GpCore::instance().submit_manual("manual_comment", text.toStdString(), actions);
 }
 
 void GpDock::onClip()

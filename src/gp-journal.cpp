@@ -228,26 +228,38 @@ void Journal::write_json() const
 
 std::string Journal::render_youtube() const
 {
-	/* YouTube rules: first chapter must be 0:00, chapters >= 10s apart. */
+	/* YouTube rules: first chapter must be 0:00, chapters >= 10s apart, >=3
+	   entries. When several events fall inside one 10s window we keep the
+	   most important one (so an ACE isn't dropped in favor of the ordinary
+	   kill that shares its timestamp). */
+	struct Chap {
+		int64_t ts;
+		int importance;
+		std::string text;
+	};
+	std::vector<Chap> chaps;
+	for (const JournalEntry &e : entries_) {
+		if (e.stream_ms < 10000 || e.importance < IMP_NOTABLE)
+			continue; /* < 10s would collide with the mandatory 0:00 */
+		std::string text = e.label;
+		if (!e.detail.empty())
+			text += " - " + e.detail;
+		if (!e.game_name.empty())
+			text += " (" + e.game_name + ")";
+		Chap c{e.stream_ms, e.importance, std::move(text)};
+		if (!chaps.empty() && c.ts - chaps.back().ts < 10000) {
+			/* same 10s window — keep whichever is more important */
+			if (c.importance > chaps.back().importance)
+				chaps.back() = std::move(c);
+		} else {
+			chaps.push_back(std::move(c));
+		}
+	}
+
 	std::ostringstream o;
 	o << "0:00 Stream start\n";
-	int64_t last_ts = 0;
-	for (const JournalEntry &e : entries_) {
-		if (e.stream_ms < 0 || e.importance < IMP_NOTABLE)
-			continue;
-		int64_t ts = e.stream_ms;
-		if (ts - last_ts < 10000 && last_ts != 0)
-			continue; /* keep >= 10s spacing */
-		if (ts < 10000)
-			continue; /* would collide with 0:00 */
-		o << format_youtube(ts) << " " << e.label;
-		if (!e.detail.empty())
-			o << " - " << e.detail;
-		if (!e.game_name.empty())
-			o << " (" << e.game_name << ")";
-		o << "\n";
-		last_ts = ts;
-	}
+	for (const Chap &c : chaps)
+		o << format_youtube(c.ts) << " " << c.text << "\n";
 	return o.str();
 }
 
@@ -276,12 +288,24 @@ std::string Journal::render_edl() const
 	   record timecodes onto the timeline start (usually 01:00:00:00), so we
 	   offset by one hour like exported timelines do. */
 	const int64_t hour_ms = 3600 * 1000;
+
+	/* Pick ONE timebase for the whole EDL so markers aren't placed on mixed
+	   record/stream clocks. Prefer the recording timeline (what you edit in
+	   Resolve); fall back to the stream clock only if nothing was recorded. */
+	bool use_record = false;
+	for (const JournalEntry &e : entries_) {
+		if (e.record_ms >= 0) {
+			use_record = true;
+			break;
+		}
+	}
+
 	std::ostringstream o;
 	o << "TITLE: GamePulse " << session_id_ << "\n";
 	o << "FCM: NON-DROP FRAME\n\n";
 	int n = 1;
 	for (const JournalEntry &e : entries_) {
-		int64_t base = e.record_ms >= 0 ? e.record_ms : e.stream_ms;
+		int64_t base = use_record ? e.record_ms : e.stream_ms;
 		if (base < 0 || e.importance < IMP_MINOR)
 			continue;
 		const char *color = e.importance >= IMP_EPIC      ? "ResolveColorRed"

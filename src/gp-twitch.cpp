@@ -162,20 +162,29 @@ void TwitchService::shutdown()
 	cancel_device_auth();
 
 	if (workers_running_) {
-		workers_running_ = false;
+		{
+			/* Flip the flag under the queue mutex so the worker can't miss
+			   the notify between its predicate check and blocking (a lost
+			   wakeup would hang OBS on exit). */
+			std::lock_guard<std::mutex> lock(queue_mutex_);
+			workers_running_ = false;
+		}
 		queue_cv_.notify_all();
 		if (marker_thread_.joinable())
 			marker_thread_.join();
 	}
 
-	irc_should_run_ = false;
-	intptr_t s = irc_socket_.exchange((intptr_t)TW_INVALID_SOCKET);
-	if (s != (intptr_t)TW_INVALID_SOCKET) {
-		tw_shutdown_both((tw_socket_t)s);
-		tw_closesocket((tw_socket_t)s);
+	{
+		std::lock_guard<std::mutex> lifecycle(irc_lifecycle_mutex_);
+		irc_should_run_ = false;
+		intptr_t s = irc_socket_.exchange((intptr_t)TW_INVALID_SOCKET);
+		if (s != (intptr_t)TW_INVALID_SOCKET) {
+			tw_shutdown_both((tw_socket_t)s);
+			tw_closesocket((tw_socket_t)s);
+		}
+		if (irc_thread_.joinable())
+			irc_thread_.join();
 	}
-	if (irc_thread_.joinable())
-		irc_thread_.join();
 
 	curl_global_cleanup();
 }
@@ -557,9 +566,16 @@ void TwitchService::marker_worker()
 			marker_queue_.pop_front();
 		}
 
-		if (!ensure_fresh_token()) {
-			obs_log(LOG_WARNING, "twitch marker dropped — not authenticated");
-			continue;
+		/* Try to freshen proactively, but don't drop the marker if a refresh
+		   fails — the current access token may still be valid, and the 401
+		   path below refreshes reactively. Only give up if we have no token. */
+		ensure_fresh_token();
+		{
+			std::lock_guard<std::mutex> lock(state_mutex_);
+			if (access_token_.empty()) {
+				obs_log(LOG_WARNING, "twitch marker dropped — not authenticated");
+				continue;
+			}
 		}
 
 		std::string token, cid, uid;
@@ -634,6 +650,11 @@ void TwitchService::apply_chat_state()
 	ChatConfig cfg = chat_config();
 	std::string channel = cfg.channel_override.empty() ? login() : cfg.channel_override;
 	bool want = cfg.enabled && !channel.empty();
+
+	/* Serialize the whole check-then-act so concurrent callers (UI thread +
+	   device-auth worker) can't both spawn or join/assign irc_thread_ at once,
+	   which would std::terminate. */
+	std::lock_guard<std::mutex> lifecycle(irc_lifecycle_mutex_);
 
 	if (want && !irc_should_run_) {
 		irc_should_run_ = true;
@@ -788,8 +809,42 @@ void TwitchService::irc_worker()
 							   end == std::string::npos ? std::string::npos : end - start);
 				};
 
+				/* IRCv3 tag values escape ';' as \: , ' ' as \s, '\' as \\,
+				   CR/LF as \r/\n. Unescape before display/use. */
+				auto unescape_tag = [](const std::string &in) -> std::string {
+					std::string out;
+					out.reserve(in.size());
+					for (size_t i = 0; i < in.size(); i++) {
+						if (in[i] == '\\' && i + 1 < in.size()) {
+							char n = in[++i];
+							switch (n) {
+							case ':':
+								out += ';';
+								break;
+							case 's':
+								out += ' ';
+								break;
+							case 'r':
+								out += '\r';
+								break;
+							case 'n':
+								out += '\n';
+								break;
+							case '\\':
+								out += '\\';
+								break;
+							default:
+								out += n;
+							}
+						} else {
+							out += in[i];
+						}
+					}
+					return out;
+				};
+
 				std::string badges = tag_value("badges");
-				std::string display = tag_value("display-name");
+				std::string display = unescape_tag(tag_value("display-name"));
 				bool is_broadcaster = badges.find("broadcaster/") != std::string::npos;
 				bool is_mod = tag_value("mod") == "1" || is_broadcaster;
 				bool is_vip = badges.find("vip/") != std::string::npos || is_mod;
@@ -805,8 +860,10 @@ void TwitchService::irc_worker()
 					allowed = is_vip;
 				else if (cfg.permission == "sub")
 					allowed = is_sub;
-				else
+				else if (cfg.permission == "anyone")
 					allowed = true;
+				else
+					allowed = false; /* unknown permission → fail closed */
 
 				if (!allowed)
 					continue;

@@ -62,6 +62,7 @@ class ValorantNormalizer {
   reset() {
     this.lastRoundPhase = '';
     this.roundNumber = 0;
+    this.localPlayer = ''; // "Name#TAG" from GEP me/player_name
   }
 
   // Returns an array of protocol event objects (may be empty).
@@ -72,7 +73,11 @@ class ValorantNormalizer {
 
     switch (key) {
       case 'kill':
-        out.push(this._mk('kill', 'Kill', '', IMP.NOTABLE, ts));
+        // The kill counter fires only for the local player, but carries no
+        // detail. Prefer kill_feed (which has weapon/victim/headshot) as the
+        // canonical kill when we can identify the local player; fall back to
+        // the counter otherwise so kills are never lost.
+        if (!this.localPlayer) out.push(this._mk('kill', 'Kill', '', IMP.NOTABLE, ts));
         break;
       case 'assist':
         out.push(this._mk('assist', 'Assist', '', IMP.MINOR, ts));
@@ -111,6 +116,10 @@ class ValorantNormalizer {
 
   handleInfo(info, ts) {
     const out = [];
+    if (info.key === 'player_name' && info.value) {
+      this.localPlayer = String(info.value); // "Name#TAG"
+      return out;
+    }
     if (info.key === 'round_phase') {
       const phase = String(info.value);
       if (phase !== this.lastRoundPhase) {
@@ -134,22 +143,25 @@ class ValorantNormalizer {
 
   _killFeed(value, ts) {
     // value: { attacker, victim, is_attacker_teammate, is_victim_teammate,
-    //          weapon, headshot, ... } (already JSON-decoded by GepService)
-    if (!value || typeof value !== 'object') {
-      return this._mk('kill_feed', 'Kill', '', IMP.MINOR, ts);
-    }
-    // Only surface feed lines involving the local player as our own kills;
-    // GEP marks the local player's kills via is_attacker_teammate on your
-    // own feed. We forward all as low-detail unless it's clearly the player's.
+    //          weapon, headshot, ... } (already JSON-decoded by GepService).
+    // The kill feed contains EVERY player's kills, not just yours — only the
+    // lines where the local player is the attacker are the streamer's kills.
+    if (!value || typeof value !== 'object') return null;
+
+    // Require a known local player so we don't double-count with the kill
+    // counter fallback (which fires while localPlayer is unknown).
+    if (!this.localPlayer) return null;
+    if ((value.attacker || '') !== this.localPlayer) return null; // someone else's kill
+
     const weapon = prettyWeapon(value.weapon);
     const victim = value.victim || '';
     const hs = value.headshot ? ' (HS)' : '';
-    const detail = [weapon, victim ? '→ ' + victim : ''].filter(Boolean).join(' ') + hs;
+    const detail = ([weapon, victim ? '→ ' + victim : ''].filter(Boolean).join(' ') + hs).trim();
 
-    // A kill_feed line that involves the local player as attacker is the
-    // richest signal for a highlight; mark headshots as notable.
-    const importance = value.headshot ? IMP.NOTABLE : IMP.MINOR;
-    return this._mk('kill_feed', 'Kill', detail.trim(), importance, ts);
+    // Emit as the canonical "kill" so the plugin's rules engine counts it for
+    // multikill/ace, now carrying weapon/victim/headshot detail. Headshots are
+    // notable.
+    return this._mk('kill', 'Kill', detail, value.headshot ? IMP.NOTABLE : IMP.NOTABLE, ts);
   }
 
   _mk(name, label, detail, importance, ts) {

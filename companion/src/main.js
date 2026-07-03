@@ -140,7 +140,7 @@ function updateTray() {
       label: simRunning ? 'Stop simulator' : 'Start simulator (mock match)',
       click: () => (simRunning ? stopSimulator() : startSimulator()),
     },
-    { label: 'Reconnect', click: () => forwarder.configure(settings.port, settings.token) },
+    { label: 'Reconnect', click: () => forwarder.reconnect() },
     { type: 'separator' },
     { label: 'Settings…', click: () => showWindow() },
     { label: 'Open log folder', click: () => shell.openPath(app.getPath('userData')) },
@@ -190,7 +190,7 @@ function initIpc() {
     return simulator ? simulator.running : false;
   });
   ipcMain.handle('reconnect', () => {
-    forwarder.configure(settings.port, settings.token);
+    forwarder.reconnect();
     return true;
   });
   ipcMain.handle('status', () => ({

@@ -355,8 +355,14 @@ void GpCore::do_marker(GpEvent &ev)
 		desc += " - " + ev.detail;
 	if (ev.stream_ms >= 0)
 		desc += " @" + format_clock(ev.stream_ms);
-	if (desc.size() > 140)
-		desc.resize(140);
+	if (desc.size() > 140) {
+		/* Twitch caps the description at 140 chars; trim back to a UTF-8
+		   boundary so we never send a truncated multibyte sequence. */
+		size_t cut = 140;
+		while (cut > 0 && (static_cast<unsigned char>(desc[cut]) & 0xC0) == 0x80)
+			cut--;
+		desc.resize(cut);
+	}
 
 	twitch_->queue_marker(desc);
 	ev.actions_taken |= ACTION_MARKER;

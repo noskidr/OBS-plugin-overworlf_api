@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "obs-plugins",
+  "owner": "damionrashford",
+  "repo": "media-os",
+  "path": "skills/obs-plugins",
+  "branch": "main",
+  "sha": "3807a949109374b3ea38533781909c6432a790f2",
+  "source": "manual"
+}
