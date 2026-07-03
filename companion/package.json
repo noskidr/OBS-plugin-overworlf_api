@@ -1,0 +1,43 @@
+{
+  "name": "GamePulseCompanion",
+  "productName": "GamePulse Companion",
+  "version": "0.1.0",
+  "description": "Forwards Overwolf GEP live game events to the GamePulse OBS plugin over localhost WebSocket.",
+  "author": {
+    "name": "Dikson Rajbanshi",
+    "email": "34827312+Noskid1999@users.noreply.github.com"
+  },
+  "license": "GPL-2.0-or-later",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "ow-electron .",
+    "start:electron": "electron .",
+    "simulate": "ow-electron . --gp-simulate",
+    "build:win": "ow-electron-builder --win --publish=never"
+  },
+  "overwolf": {
+    "packages": [
+      "gep"
+    ]
+  },
+  "build": {
+    "appId": "com.noskidr.gamepulse-companion",
+    "productName": "GamePulse Companion",
+    "files": [
+      "src/**/*",
+      "assets/**/*"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "overwolf": {
+      "disableAdOptimization": true
+    }
+  },
+  "devDependencies": {
+    "@overwolf/ow-electron": "^39.6.1",
+    "@overwolf/ow-electron-builder": "^26.8.5",
+    "@overwolf/ow-electron-packages-types": "^1.1.4",
+    "electron": "^39.0.0"
+  }
+}

@@ -1,0 +1,116 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';" />
+    <title>GamePulse Companion</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        font-family: "Segoe UI", system-ui, sans-serif;
+        background: #14161c;
+        color: #e6e9ee;
+        margin: 0;
+        padding: 16px;
+        font-size: 13px;
+      }
+      h1 { font-size: 15px; margin: 0 0 4px; }
+      .sub { color: #8a93a0; margin-bottom: 16px; }
+      .card { background: #1b1e26; border: 1px solid #262b36; border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+      label { display: block; color: #aab3c0; margin: 8px 0 3px; }
+      input {
+        width: 100%; box-sizing: border-box; background: #0f1116; color: #e6e9ee;
+        border: 1px solid #2c3340; border-radius: 6px; padding: 7px 9px; font-size: 13px;
+      }
+      .row { display: flex; gap: 10px; }
+      .row > div { flex: 1; }
+      button {
+        background: #2d5cff; color: #fff; border: 0; border-radius: 6px;
+        padding: 8px 14px; font-size: 13px; cursor: pointer; margin-top: 10px;
+      }
+      button.secondary { background: #2c3340; }
+      button:hover { filter: brightness(1.1); }
+      .status { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+      .dot { width: 10px; height: 10px; border-radius: 50%; background: #82929e; }
+      .dot.on { background: #2ecc71; }
+      #log {
+        background: #0c0e12; border: 1px solid #262b36; border-radius: 8px; padding: 8px;
+        height: 150px; overflow-y: auto; font-family: "Cascadia Code", monospace; font-size: 11px;
+        white-space: pre-wrap; color: #9aa6b2;
+      }
+      .hint { color: #6f7a88; font-size: 11px; margin-top: 4px; }
+    </style>
+  </head>
+  <body>
+    <h1>GamePulse Companion</h1>
+    <div class="sub">Forwards Valorant game events to the GamePulse OBS plugin.</div>
+
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <span id="statusText">Waiting for OBS plugin…</span>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <div>
+          <label>Plugin port</label>
+          <input id="port" type="number" min="1" max="65535" />
+        </div>
+        <div>
+          <label>Token (optional)</label>
+          <input id="token" type="text" placeholder="shared secret" />
+        </div>
+      </div>
+      <div class="hint">Must match the port &amp; token in the OBS GamePulse dock.</div>
+      <button id="save">Save &amp; Connect</button>
+      <button id="reconnect" class="secondary">Reconnect</button>
+    </div>
+
+    <div class="card">
+      <button id="sim" class="secondary">Start simulator (mock match)</button>
+      <div class="hint">Feeds a scripted Valorant match so you can test OBS without launching the game.</div>
+    </div>
+
+    <div class="card">
+      <label>Activity log</label>
+      <div id="log"></div>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      async function refresh() {
+        const s = await window.gp.status();
+        $('dot').className = 'dot' + (s.connected ? ' on' : '');
+        $('statusText').textContent = s.connected
+          ? 'Connected to OBS plugin' + (s.simulating ? ' — simulating' : '')
+          : 'Waiting for OBS plugin…';
+        $('sim').textContent = s.simulating ? 'Stop simulator' : 'Start simulator (mock match)';
+      }
+
+      window.gp.getSettings().then((s) => {
+        $('port').value = s.port;
+        $('token').value = s.token || '';
+      });
+      window.gp.onSettings((s) => {
+        $('port').value = s.port;
+        $('token').value = s.token || '';
+      });
+      window.gp.onLog((line) => {
+        const el = $('log');
+        el.textContent += (el.textContent ? '\n' : '') + line;
+        el.scrollTop = el.scrollHeight;
+      });
+
+      $('save').onclick = async () => {
+        await window.gp.saveSettings({ port: parseInt($('port').value, 10) || 4477, token: $('token').value.trim() });
+        refresh();
+      };
+      $('reconnect').onclick = async () => { await window.gp.reconnect(); refresh(); };
+      $('sim').onclick = async () => { await window.gp.toggleSimulator(); refresh(); };
+
+      setInterval(refresh, 1500);
+      refresh();
+    </script>
+  </body>
+</html>
